@@ -397,7 +397,8 @@ class GitHandler(object):
             obj = self.git.get_object(sha)
             assert isinstance(obj, Commit)
             # Order parents so that oldest child will assign its
-            # branch to its parent, and so on.
+            # branch to its parent, and so on.  This choice is of
+            # course arbitrary.
             parents = obj.parents
             parents.sort(key=commitdate)
             for p in parents:
@@ -507,9 +508,7 @@ class GitHandler(object):
             pa = node1.ancestor(node2)
 
         # if named branch, add to extra
-        if hg_branch:
-            assert hg_branch == git_branch
-        else:
+        if not hg_branch:
             hg_branch = git_branch
 
         if hg_branch:
