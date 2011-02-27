@@ -356,12 +356,16 @@ class GitHandler(object):
         todo = []
         done = set()
         convert_list = {}
+        revref = {}
 
         # get a list of all the head shas
         seenheads = set()
         if refs is None:
             refs = self.git.refs.as_dict()
         if refs:
+            for k in refs:
+                if k.startswith('refs/heads/'):
+                    revref[refs[k]] = k.replace('refs/heads/', '', 1)
             for sha in refs.itervalues():
                 # refs contains all the refs in the server, not just the ones
                 # we are pulling
@@ -392,9 +396,15 @@ class GitHandler(object):
             assert isinstance(sha, str)
             obj = self.git.get_object(sha)
             assert isinstance(obj, Commit)
-            for p in obj.parents:
+            # Order parents so that oldest child will assign its
+            # branch to its parent, and so on.
+            parents = obj.parents
+            parents.sort(key=commitdate)
+            for p in parents:
                 if p not in done:
                     todo.append(p)
+                    if sha in revref and p not in revref:
+                        revref[p] = revref[sha]
                     break
             else:
                 commits.append(sha)
@@ -408,10 +418,11 @@ class GitHandler(object):
         for i, csha in enumerate(commits):
             util.progress(self.ui, 'import', i, total=total, unit='commits')
             commit = convert_list[csha]
-            self.import_git_commit(commit)
+            git_branch = revref[csha] if csha in revref else None
+            self.import_git_commit(commit, git_branch)
         util.progress(self.ui, 'import', None, total=total, unit='commits')
 
-    def import_git_commit(self, commit):
+    def import_git_commit(self, commit, git_branch):
         self.ui.debug(_("importing: %s\n") % commit.id)
 
         (strip_message, hg_renames,
@@ -496,6 +507,11 @@ class GitHandler(object):
             pa = node1.ancestor(node2)
 
         # if named branch, add to extra
+        if hg_branch:
+            assert hg_branch == git_branch
+        else:
+            hg_branch = git_branch
+
         if hg_branch:
             extra['branch'] = hg_branch
 
@@ -732,7 +748,7 @@ class GitHandler(object):
                     if bm.ancestor(self.repo[hgsha]) == bm:
                         # fast forward
                         bms[head] = hgsha
-            if heads:
+            if False and heads:
                 if oldbm:
                     bookmarks.write(self.repo, bms)
                 else:
