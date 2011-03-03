@@ -7,7 +7,6 @@ from dulwich.pack import create_delta, apply_delta
 from dulwich.repo import Repo
 from dulwich import client
 
-from hgext import bookmarks
 from mercurial.i18n import _
 from mercurial.node import hex, bin, nullid
 from mercurial import context, util as hgutil
@@ -99,7 +98,6 @@ class GitHandler(object):
         if refs:
             self.import_git_objects(remote_name, refs)
             self.import_tags(refs)
-            self.update_hg_bookmarks(refs)
             if remote_name:
                 self.update_remote_branches(remote_name, refs)
             elif not self.paths:
@@ -567,13 +565,11 @@ class GitHandler(object):
     def get_changed_refs(self, refs, revs, force):
         new_refs = refs.copy()
 
-        #The remote repo is empty and the local one doesn't have bookmarks/tags
+        #The remote repo is empty and the local one doesn't have tags
         if refs.keys()[0] == 'capabilities^{}':
             del new_refs['capabilities^{}']
             if not self.local_heads():
                 tip = hex(self.repo.lookup('tip'))
-                bookmarks.bookmark(self.ui, self.repo, 'master', tip, force=True)
-                bookmarks.setcurrent(self.repo, 'master')
                 new_refs['refs/heads/master'] = self.map_git_get(tip)
 
         for rev in revs:
@@ -673,7 +669,7 @@ class GitHandler(object):
         heads = self.local_heads()
 
         # Create a local Git branch name for each
-        # Mercurial bookmark.
+        # Mercurial branch.
         for key in heads:
             self.git.refs['refs/heads/' + key] = self.map_git_get(heads[key])
 
@@ -684,14 +680,12 @@ class GitHandler(object):
                 self.tags[tag] = hex(sha)
 
     def local_heads(self):
-        try:
-            if getattr(bookmarks, 'parse', None):
-                bms = bookmarks.parse(self.repo)
-            else:
-                bms = self.repo._bookmarks
-            return dict([(bm, hex(bms[bm])) for bm in bms])
-        except AttributeError: #pragma: no cover
-            return {}
+        branchmap = self.repo.branchmap()
+        # TODO: implement escaping of non-supported characters,
+        # i.e. map Mercurial branch name my:branch to Git branch name
+        # my_3A_branch, and back.
+        return dict([(b, hex(branchmap[b][-1]))
+                     for b in branchmap if b.find(':') == -1])
 
     def import_tags(self, refs):
         keys = refs.keys()
@@ -722,41 +716,6 @@ class GitHandler(object):
                             # TODO: better handling for annotated tags
                             self.tags[ref_name] = sha
         self.save_tags()
-
-    def update_hg_bookmarks(self, refs):
-        try:
-            oldbm = getattr(bookmarks, 'parse', None)
-            if oldbm:
-                bms = bookmarks.parse(self.repo)
-            else:
-                bms = self.repo._bookmarks
-            heads = dict([(ref[11:],refs[ref]) for ref in refs
-                          if ref.startswith('refs/heads/')])
-
-            for head, sha in heads.iteritems():
-                # refs contains all the refs in the server, not just
-                # the ones we are pulling
-                if sha not in self.git.object_store:
-                    continue
-                hgsha = bin(self.map_hg_get(sha))
-                if not head in bms:
-                    # new branch
-                    bms[head] = hgsha
-                else:
-                    bm = self.repo[bms[head]]
-                    if bm.ancestor(self.repo[hgsha]) == bm:
-                        # fast forward
-                        bms[head] = hgsha
-            if False and heads:
-                if oldbm:
-                    bookmarks.write(self.repo, bms)
-                else:
-                    self.repo._bookmarks = bms
-                    bookmarks.write(self.repo)
-
-        except AttributeError:
-            self.ui.warn(_('creating bookmarks failed, do you have'
-                         ' bookmarks enabled?\n'))
 
     def update_remote_branches(self, remote_name, refs):
         tagfile = self.repo.join(os.path.join('git-remote-refs'))
