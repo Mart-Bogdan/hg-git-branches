@@ -32,5 +32,12 @@ class gitrepo(repo.repository):
     def pushkey(self, namespace, key, old, new):
         return False
 
+    # used by incoming in hg <= 1.6
+    def branches(self, nodes):
+        return []
 
 instance = gitrepo
+
+def islocal(path):
+    u = util.url(path)
+    return not u.scheme or u.scheme == 'file'

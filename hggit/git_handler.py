@@ -1,12 +1,18 @@
 import os, math, urllib, re
 
-from dulwich.errors import HangupException
+from dulwich.errors import HangupException, GitProtocolError
 from dulwich.index import commit_tree
 from dulwich.objects import Blob, Commit, Tag, Tree, parse_timezone
 from dulwich.pack import create_delta, apply_delta
 from dulwich.repo import Repo
 from dulwich import client
 
+try:
+    from mercurial import bookmarks
+    bookmarks.update
+    from mercurial import commands
+except ImportError:
+    from hgext import bookmarks
 from mercurial.i18n import _
 from mercurial.node import hex, bin, nullid
 from mercurial import context, util as hgutil
@@ -14,6 +20,47 @@ from mercurial import error
 
 import _ssh
 import util
+from overlay import overlayrepo
+
+class GitProgress(object):
+    """convert git server progress strings into mercurial progress"""
+    def __init__(self, ui):
+        self.ui = ui
+
+        self.lasttopic = None
+        self.msgbuf = ''
+
+    def progress(self, msg):
+        # 'Counting objects: 33640, done.\n'
+        # 'Compressing objects:   0% (1/9955)   \r
+        msgs = re.split('[\r\n]', self.msgbuf + msg)
+        self.msgbuf = msgs.pop()
+
+        for msg in msgs:
+            td = msg.split(':', 1)
+            data = td.pop()
+            if not td:
+                self.flush(data)
+                continue
+            topic = td[0]
+
+            m = re.search('\((\d+)/(\d+)\)', data)
+            if m:
+                if self.lasttopic and self.lasttopic != topic:
+                    self.flush()
+                self.lasttopic = topic
+
+                pos, total = map(int, m.group(1, 2))
+                util.progress(self.ui, topic, pos, total=total)
+            else:
+                self.flush(msg)
+
+    def flush(self, msg=None):
+        if self.lasttopic:
+            util.progress(self.ui, self.lasttopic, None)
+        self.lasttopic = None
+        if msg:
+            self.ui.note(msg + '\n')
 
 class GitHandler(object):
     mapfile = 'git-mapfile'
@@ -95,6 +142,7 @@ class GitHandler(object):
         refs = self.fetch_pack(remote, heads)
         remote_name = self.remote_name(remote)
 
+        oldrefs = self.git.get_refs()
         if refs:
             self.import_git_objects(remote_name, refs)
             self.import_tags(refs)
@@ -103,10 +151,27 @@ class GitHandler(object):
             elif not self.paths:
                 # intial cloning
                 self.update_remote_branches('default', refs)
-        else:
-            self.ui.status(_("nothing new on the server\n"))
+
+                # "Activate" a tipmost bookmark.
+                bms = getattr(self.repo['tip'], 'bookmarks',
+                              lambda : None)()
+                if bms:
+                    bookmarks.setcurrent(self.repo, bms[0])
+
+        def remoteref(ref):
+            rn = remote_name or 'default'
+            return 'refs/remotes/' + rn + ref[10:]
+
+        modheads = [refs[k] for k in refs if k.startswith('refs/heads/')
+                    and not k.endswith('^{}')
+                    and refs[k] != oldrefs.get(remoteref(k))]
+
+        if not modheads:
+            self.ui.status(_("no changes found\n"))
 
         self.save_map()
+
+        return len(modheads)
 
     def export_commits(self):
         try:
@@ -135,11 +200,11 @@ class GitHandler(object):
                             if sha != old_refs.get(ref)]
             new = [bin(self.map_hg_get(new_refs[ref])) for ref in changed_refs]
             old = dict( (bin(self.map_hg_get(old_refs[r])), 1)
-                       for r in changed_refs if r in old_refs)
+                       for r in old_refs)
 
             return old, new
-        except HangupException:
-            raise hgutil.Abort("the remote end hung up unexpectedly")
+        except (HangupException, GitProtocolError), e:
+            raise hgutil.Abort(_("git remote error: ") + str(e))
 
     def push(self, remote, revs, force):
         self.export_commits()
@@ -165,17 +230,39 @@ class GitHandler(object):
         if os.path.exists(mapfile):
             os.remove(mapfile)
 
+    # incoming support
+    def getremotechanges(self, remote, revs):
+        self.export_commits()
+        refs = self.fetch_pack(remote.path, revs)
+
+        # refs contains all remote refs. Prune to only those requested.
+        if revs:
+            reqrefs = {}
+            for rev in revs:
+                for n in ('refs/heads/' + rev, 'refs/tags/' + rev):
+                    if n in refs:
+                        reqrefs[n] = refs[n]
+        else:
+            reqrefs = refs
+
+        commits = [bin(c) for c in self.getnewgitcommits(reqrefs)[1]]
+
+        b = overlayrepo(self, commits, refs)
+
+        return (b, commits, lambda: None)
+
     ## CHANGESET CONVERSION METHODS
 
     def export_git_objects(self):
-        self.ui.status(_("importing Hg objects into Git\n"))
         self.init_if_missing()
 
         nodes = [self.repo.lookup(n) for n in self.repo]
         export = [node for node in nodes if not hex(node) in self._map_hg]
         total = len(export)
+        if total:
+            self.ui.status(_("exporting hg objects to git\n"))
         for i, rev in enumerate(export):
-            util.progress(self.ui, 'import', i, total=total)
+            util.progress(self.ui, 'exporting', i, total=total)
             ctx = self.repo.changectx(rev)
             state = ctx.extra().get('hg-git', None)
             if state == 'octopus':
@@ -183,7 +270,7 @@ class GitHandler(object):
                               "of octopus explosion\n" % ctx.rev())
                 continue
             self.export_hg_commit(rev)
-        util.progress(self.ui, 'import', None, total=total)
+        util.progress(self.ui, 'importing', None, total=total)
 
 
     # convert this commit into git objects
@@ -260,6 +347,8 @@ class GitHandler(object):
             if len(a.group(3)) > 0:
                 name += ' ext:(' + urllib.quote(a.group(3)) + ')'
             author = name + ' <' + email + '>'
+        elif '@' in author:
+            author = author + ' <' + author + '>'
         else:
             author = author + ' <none@none>'
 
@@ -346,8 +435,7 @@ class GitHandler(object):
 
             yield f, blobid, mode
 
-    def import_git_objects(self, remote_name=None, refs=None):
-        self.ui.status(_("importing Git objects into Hg\n"))
+    def getnewgitcommits(self, refs=None):
         self.init_if_missing()
 
         # import heads and fetched tags as remote references
@@ -411,15 +499,35 @@ class GitHandler(object):
                 done.add(sha)
                 todo.pop()
 
-        commits = [commit for commit in commits if not commit in self._map_git]
+        return convert_list, [commit for commit in commits if not commit in self._map_git]
+
+    def import_git_objects(self, remote_name=None, refs=None):
+        convert_list, commits = self.getnewgitcommits(refs)
         # import each of the commits, oldest first
         total = len(commits)
+        if total:
+            self.ui.status(_("importing git objects into hg\n"))
+
         for i, csha in enumerate(commits):
-            util.progress(self.ui, 'import', i, total=total, unit='commits')
+            util.progress(self.ui, 'importing', i, total=total, unit='commits')
             commit = convert_list[csha]
             git_branch = revref[csha] if csha in revref else None
             self.import_git_commit(commit, git_branch)
-        util.progress(self.ui, 'import', None, total=total, unit='commits')
+        util.progress(self.ui, 'importing', None, total=total, unit='commits')
+
+        # Remove any dangling tag references.
+        for name, rev in self.repo.tags().items():
+            if not rev in self.repo:
+                if hasattr(self, 'tagscache') and self.tagscache and \
+                        'name' in self.tagscache:
+                    # Mercurial 1.4 and earlier.
+                    del self.repo.tagscache[name]
+                elif hasattr(self, '_tags') and self._tags and \
+                        'name' in self._tags:
+                    # Mercurial 1.5 and later.
+                    del self.repo._tags[name]
+                if name in self.repo._tagtypes:
+                    del self.repo._tagtypes[name]
 
     def import_git_commit(self, commit, git_branch):
         self.ui.debug(_("importing: %s\n") % commit.id)
@@ -467,14 +575,38 @@ class GitHandler(object):
 
         oldenc = self.swap_out_encoding()
 
-        def getfilectx(repo, memctx, f):
-            delete, mode, sha = files[f]
-            if delete:
-                raise IOError
+        def findconvergedfiles(p1, p2):
+            # If any files have the same contents in both parents of a merge
+            # (and are therefore not reported as changed by Git) but are at
+            # different file revisions in Mercurial (because they arrived at
+            # those contents in different ways), we need to include them in
+            # the list of changed files so that Mercurial can join up their
+            # filelog histories (same as if the merge was done in Mercurial to
+            # begin with).
+            if p2 == nullid:
+                return []
+            manifest1 = self.repo.changectx(p1).manifest()
+            manifest2 = self.repo.changectx(p2).manifest()
+            return [path for path, node1 in manifest1.iteritems()
+                    if path not in files and manifest2.get(path, node1) != node1]
 
-            data = self.git[sha].data
-            copied_path = hg_renames.get(f)
-            e = self.convert_git_int_mode(mode)
+        def getfilectx(repo, memctx, f):
+            info = files.get(f)
+            if info != None:
+                # it's a file reported as modified from Git
+                delete, mode, sha = info
+                if delete:
+                    raise IOError
+
+                data = self.git[sha].data
+                copied_path = hg_renames.get(f)
+                e = self.convert_git_int_mode(mode)
+            else:
+                # it's a converged file
+                fc = context.filectx(self.repo, f, changeid=memctx.p1().rev())
+                data = fc.data()
+                e = fc.flags()
+                copied_path = fc.renamed()
 
             return context.memfilectx(f, data, 'l' in e, 'x' in e, copied_path)
 
@@ -485,8 +617,9 @@ class GitHandler(object):
         if len(gparents) > 1:
             # merge, possibly octopus
             def commit_octopus(p1, p2):
-                ctx = context.memctx(self.repo, (p1, p2), text, list(files), getfilectx,
-                                     author, date, {'hg-git': 'octopus'})
+                ctx = context.memctx(self.repo, (p1, p2), text,
+                                     list(files) + findconvergedfiles(p1, p2),
+                                     getfilectx, author, date, {'hg-git': 'octopus'})
                 return hex(self.repo.commitctx(ctx))
 
             octopus = len(gparents) > 2
@@ -535,8 +668,9 @@ class GitHandler(object):
         if not (repo_contains(p1) and repo_contains(p2)):
             raise hgutil.Abort(_('you appear to have run strip - '
                                  'please run hg git-cleanup'))
-        ctx = context.memctx(self.repo, (p1, p2), text, list(files), getfilectx,
-                             author, date, extra)
+        ctx = context.memctx(self.repo, (p1, p2), text,
+                             list(files) + findconvergedfiles(p1, p2),
+                             getfilectx, author, date, extra)
 
         node = self.repo.commitctx(ctx)
 
@@ -559,8 +693,8 @@ class GitHandler(object):
             self.ui.status(_("creating and sending data\n"))
             changed_refs = client.send_pack(path, changed, genpack)
             return changed_refs
-        except HangupException:
-            raise hgutil.Abort("the remote end hung up unexpectedly")
+        except (HangupException, GitProtocolError), e:
+            raise hgutil.Abort(_("git remote error: ") + str(e))
 
     def get_changed_refs(self, refs, revs, force):
         new_refs = refs.copy()
@@ -570,12 +704,23 @@ class GitHandler(object):
             del new_refs['capabilities^{}']
             if not self.local_heads():
                 tip = hex(self.repo.lookup('tip'))
+                try:
+                    commands.bookmark(self.ui, self.repo, 'master', tip, force=True)
+                except NameError:
+                    bookmarks.bookmark(self.ui, self.repo, 'master', tip, force=True)
+                bookmarks.setcurrent(self.repo, 'master')
                 new_refs['refs/heads/master'] = self.map_git_get(tip)
 
         for rev in revs:
             ctx = self.repo[rev]
-            heads = [t for t in ctx.tags() if t in self.local_heads()]
-            tags = [t for t in ctx.tags() if t in self.tags]
+            if getattr(ctx, 'bookmarks', None):
+                labels = lambda c: ctx.tags() + ctx.bookmarks()
+            else:
+                labels = lambda c: ctx.tags()
+            prep = lambda itr: [i.replace(' ', '_') for i in itr]
+
+            heads = [t for t in prep(labels(ctx)) if t in self.local_heads()]
+            tags = [t for t in prep(labels(ctx)) if t in self.tags]
 
             if not (heads or tags):
                 raise hgutil.Abort("revision %s cannot be pushed since"
@@ -652,14 +797,18 @@ class GitHandler(object):
             else:
                 want = [sha for ref, sha in refs.iteritems()
                         if not ref.endswith('^{}')]
+            want = [x for x in want if x not in self.git]
             return want
         f, commit = self.git.object_store.add_pack()
         try:
             try:
-                return client.fetch_pack(path, determine_wants, graphwalker,
-                                         f.write, self.ui.status)
-            except HangupException:
-                raise hgutil.Abort("the remote end hung up unexpectedly")
+                progress = GitProgress(self.ui)
+                ret = client.fetch_pack(path, determine_wants, graphwalker,
+                                        f.write, progress.progress)
+                progress.flush()
+                return ret
+            except (HangupException, GitProtocolError), e:
+                raise hgutil.Abort(_("git remote error: ") + str(e))
         finally:
             commit()
 
@@ -676,6 +825,7 @@ class GitHandler(object):
     def export_hg_tags(self):
         for tag, sha in self.repo.tags().iteritems():
             if self.repo.tagtype(tag) in ('global', 'git'):
+                tag = tag.replace(' ', '_')
                 self.git.refs['refs/tags/' + tag] = self.map_git_get(hex(sha))
                 self.tags[tag] = hex(sha)
 

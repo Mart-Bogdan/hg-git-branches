@@ -65,13 +65,13 @@ cd ..
 git daemon --base-path="$(pwd)"\
  --listen=localhost\
  --export-all\
- --pid-file=gitdaemon.pid \
+ --pid-file="$DAEMON_PIDS" \
  --detach --reuseaddr \
  --enable=receive-pack
 
 hg clone git://localhost/gitrepo hgrepo | grep -v '^updating'
 cd hgrepo
-hg log --graph
+hg log --graph --style compact | sed 's/\[.*\]//g'
 
 hg gclear
 hg push git://localhost/gitrepo2
@@ -80,4 +80,3 @@ cd ../gitrepo2
 git log --pretty=medium | sed s/\\.\\.\\.//g
 
 cd ..
-kill `cat gitdaemon.pid`

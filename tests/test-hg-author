@@ -57,7 +57,7 @@ cd ..
 git daemon --base-path="$(pwd)"\
  --listen=localhost\
  --export-all\
- --pid-file=gitdaemon.pid \
+ --pid-file="$DAEMON_PIDS" \
  --detach --reuseaddr \
  --enable=receive-pack
 
@@ -74,12 +74,11 @@ echo gamma >> beta
 hgcommit -u "test <test@example.com> (comment)" -m 'modify beta'
 hg push
 
-hg log --graph
+hg log --graph | egrep -v ': *(not-master|master)'
 
 cd ..
 hg clone git://localhost/gitrepo hgrepo2 | grep -v '^updating'
 cd hgrepo2
-hg log --graph
+hg log --graph | egrep -v ': *(not-master|master)'
 
 cd ..
-kill `cat gitdaemon.pid`

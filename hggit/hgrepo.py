@@ -11,7 +11,7 @@ def generate_repo_subclass(baseclass):
         def pull(self, remote, heads=None, force=False):
             if isinstance(remote, gitrepo):
                 git = GitHandler(self, self.ui)
-                git.fetch(remote.path, heads)
+                return git.fetch(remote.path, heads)
             else: #pragma: no cover
                 return super(hgrepo, self).pull(remote, heads, force)
 
@@ -42,9 +42,6 @@ def generate_repo_subclass(baseclass):
 
             git = GitHandler(self, self.ui)
             for tag, rev in git.tags.iteritems():
-                if tag in tags:
-                    continue
-
                 tags[tag] = bin(rev)
                 tagtypes[tag] = 'git'
 
@@ -60,22 +57,24 @@ def generate_repo_subclass(baseclass):
             return {}
 
         def tags(self):
-            if not hasattr(self, 'tagscache'):
-                # mercurial 1.4
-                tmp = super(hgrepo, self).tags()
-                tmp.update(self.gitrefs())
-                return tmp
-            if self.tagscache:
+            if hasattr(self, 'tagscache') and self.tagscache:
+                # Mercurial 1.4 and earlier.
                 return self.tagscache
+            elif hasattr(self, '_tags') and self._tags:
+                # Mercurial 1.5 and later.
+                return self._tags
 
             git = GitHandler(self, self.ui)
             tagscache = super(hgrepo, self).tags()
+            tagscache.update(self.gitrefs())
             for tag, rev in git.tags.iteritems():
                 if tag in tagscache:
                     continue
 
                 tagscache[tag] = bin(rev)
-                self._tagstypecache[tag] = 'git'
+                if hasattr(self, '_tagstypecache'):
+                    # Only present in Mercurial 1.3 and earlier.
+                    self._tagstypecache[tag] = 'git'
 
             return tagscache
 

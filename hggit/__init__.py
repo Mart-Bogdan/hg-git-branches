@@ -18,12 +18,14 @@ Try hg clone git:// or hg clone git+ssh://
 import inspect
 import os
 
+from mercurial import bundlerepo
 from mercurial import commands
 from mercurial import demandimport
 from mercurial import extensions
 from mercurial import hg
 from mercurial import localrepo
 from mercurial import util as hgutil
+from mercurial import url
 from mercurial.i18n import _
 
 demandimport.ignore.extend([
@@ -41,8 +43,18 @@ hg.schemes['git+ssh'] = gitrepo
 # support for `hg clone localgitrepo`
 _oldlocal = hg.schemes['file']
 
+try:
+    urlcls = hgutil.url
+except AttributeError:
+    class urlcls(object):
+        def __init__(self, path):
+            self.p = hgutil.drop_scheme('file', path)
+
+        def localpath(self):
+            return self.p
+
 def _local(path):
-    p = hgutil.drop_scheme('file', path)
+    p = urlcls(path).localpath()
     if (os.path.exists(os.path.join(p, '.git')) and
         not os.path.exists(os.path.join(p, '.hg'))):
         return gitrepo
@@ -114,14 +126,16 @@ try:
     kwname = 'heads'
     if hg.util.version() >= '1.7':
         kwname = 'remoteheads'
+    if getattr(discovery, 'findcommonoutgoing', None):
+        kwname = 'onlyheads'
     def findoutgoing(orig, local, remote, *args, **kwargs):
-        kw = {}
-        kw.update(kwargs)
-        for val, k in zip(args, ('base', kwname, 'force')):
-            kw[k] = val
         if isinstance(remote, gitrepo.gitrepo):
             # clean up this cruft when we're 1.7-only, remoteheads and
             # the return value change happened between 1.6 and 1.7.
+            kw = {}
+            kw.update(kwargs)
+            for val, k in zip(args, ('base', kwname, 'force')):
+                kw[k] = val
             git = GitHandler(local, local.ui)
             base, heads = git.get_refs(remote.path)
             newkw = {'base': base, kwname: heads}
@@ -130,9 +144,32 @@ try:
             if kwname == 'heads':
                 r = orig(local, remote, **kw)
                 return [x[0] for x in r]
-        return orig(local, remote, **kw)
-    extensions.wrapfunction(discovery, 'findoutgoing', findoutgoing)
+            if kwname == 'onlyheads':
+                del kw['base']
+            return orig(local, remote, **kw)
+        return orig(local, remote, *args, **kwargs)
+    if getattr(discovery, 'findoutgoing', None):
+        extensions.wrapfunction(discovery, 'findoutgoing', findoutgoing)
+    else:
+        extensions.wrapfunction(discovery, 'findcommonoutgoing',
+                                findoutgoing)
 except ImportError:
+    pass
+
+def getremotechanges(orig, ui, repo, other, *args, **opts):
+    if isinstance(other, gitrepo.gitrepo):
+        revs = opts.get('onlyheads', opts.get('revs'))
+        git = GitHandler(repo, ui)
+        r, c, cleanup = git.getremotechanges(other, revs)
+        # ugh. This is ugly even by mercurial API compatibility standards
+        if 'onlyheads' not in orig.func_code.co_varnames:
+            cleanup = None
+        return r, c, cleanup
+    return orig(ui, repo, other, *args, **opts)
+try:
+    extensions.wrapfunction(bundlerepo, 'getremotechanges', getremotechanges)
+except AttributeError:
+    # 1.7+
     pass
 
 cmdtable = {

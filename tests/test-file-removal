@@ -60,13 +60,13 @@ cd ..
 git daemon --base-path="$(pwd)"\
  --listen=localhost\
  --export-all\
- --pid-file=gitdaemon.pid \
+ --pid-file="$DAEMON_PIDS" \
  --detach --reuseaddr \
  --enable=receive-pack
 
 hg clone git://localhost/gitrepo hgrepo | grep -v '^updating'
 cd hgrepo
-hg log --graph
+hg log --graph | grep -v ': *master'
 
 echo
 echo % make sure alpha is not in this manifest
@@ -83,4 +83,3 @@ cd ../gitrepo2
 git log --pretty=medium
 
 cd ..
-kill `cat gitdaemon.pid`
